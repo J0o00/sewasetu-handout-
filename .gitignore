@@ -1,0 +1,13 @@
+# Backups and temporary data
+sewasetu-handout/backup/
+sewasetu-handout/logs/extracted/
+sewasetu-handout/dc-briefing-transcript.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Logs
+*.log
