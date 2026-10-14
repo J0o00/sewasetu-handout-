@@ -20,7 +20,9 @@ import requests
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 config = configparser.ConfigParser()
-CONFIG_PATH = os.path.join(BASE_DIR, "config", "settings.ini")
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "app.ini")
+if not os.path.exists(CONFIG_PATH):
+    CONFIG_PATH = os.path.join(BASE_DIR, "config", "settings.ini")
 with open(CONFIG_PATH) as fh:
     config.read_file(fh)
 

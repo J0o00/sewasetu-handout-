@@ -420,6 +420,15 @@ def view_application(app_id):
     # Enforce object-level authorization: citizens can only view their own application
     if not session.get("admin") and session.get("portal_mobile") != row[2]:
         abort(403)
+    # Under RTPS Act: an eligible application left untouched beyond the 15-day SLA
+    # stands approved, and citizen-facing status must display deemed approval.
+    status = row[8]
+    submitted_at = row[9]
+    if status == 'PENDING' and submitted_at:
+        if (datetime.now() - submitted_at).total_seconds() >= SLA_DAYS * 86400:
+            row_list = list(row)
+            row_list[8] = 'DEEMED_APPROVED'
+            row = tuple(row_list)
     return render_template("application.html", a=row, app_id=app_id)
 
 
