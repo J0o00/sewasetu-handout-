@@ -27,8 +27,15 @@ config = configparser.ConfigParser()
 config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 
 app = Flask(__name__)
-app.secret_key = config.get("app", "secret_key")
+# SECRET_KEY: prefer environment variable for production deployments.
+# The app.ini value is the fallback for local/Docker Compose use.
+app.secret_key = os.environ.get("SECRET_KEY") or config.get("app", "secret_key")
 app.config["PERMANENT_SESSION_LIFETIME"] = 300
+# Secure cookie flags — set SESSION_COOKIE_SECURE=1 env var behind HTTPS
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+if os.environ.get("SESSION_COOKIE_SECURE", "").strip() == "1":
+    app.config["SESSION_COOKIE_SECURE"] = True
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "sewasetu@123"
@@ -62,17 +69,61 @@ def get_db():
         dbname=config.get("database", "name"),
         user=config.get("database", "user"),
         password=config.get("database", "password"),
+        connect_timeout=5,
     )
 
 
-def sanitize(value, maxlen=20):
-    # Trim input to safe length for downstream systems (NIC mandate 2019:
-    # legacy disbursement interface accepts fixed-width fields).
+from contextlib import contextmanager
+
+@contextmanager
+def db_cursor():
+    """Context manager that opens a connection+cursor and always closes both."""
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        yield conn, cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _ensure_indexes():
+    """Create performance indexes if they don't exist. Idempotent (IF NOT EXISTS)."""
+    stmts = [
+        # Duplicate-check and login query: WHERE mobile = %s
+        "CREATE INDEX IF NOT EXISTS idx_applications_mobile ON applications (mobile)",
+        # Admin list query: WHERE status = %s ORDER BY submitted_at
+        "CREATE INDEX IF NOT EXISTS idx_applications_status_submitted ON applications (status, submitted_at)",
+        # RTPS scheduler cutoff query: WHERE status='PENDING' AND submitted_at < %s
+        "CREATE INDEX IF NOT EXISTS idx_applications_pending_submitted ON applications (submitted_at) WHERE status = 'PENDING'",
+    ]
+    try:
+        with db_cursor() as (conn, cur):
+            for stmt in stmts:
+                cur.execute(stmt)
+        app.logger.info("performance indexes verified")
+    except Exception as e:
+        app.logger.warning("could not create indexes: %s" % e)
+
+
+# Ensure indexes exist at startup (safe to call multiple times)
+with app.app_context():
+    try:
+        _ensure_indexes()
+    except Exception:
+        pass  # DB may not be ready at import time; scheduler will work regardless
+
+
+def sanitize(value, maxlen=100):
+    # Sanitize and trim input up to maxlen characters, preserving multi-byte UTF-8 Indic codepoints
     if value is None:
         return ""
     value = value.strip()
-    encoded = value.encode("utf-8")[:maxlen]
-    return encoded.decode("utf-8", errors="ignore")
+    return value[:maxlen]
 
 
 def hash_password(p):
@@ -214,15 +265,17 @@ def upload():
     if request.method == "POST":
         f = request.files.get("document")
         if f is None or f.filename == "":
-            flash("ERR_VAL_47")
+            flash("Please select a document to upload (JPG or PDF).")
             return render_template("upload.html")
         filename = f.filename.lower()
         content = f.read()
-        if not filename.endswith(".pdf"):
-            flash("ERR_VAL_47")
+        # Accept JPG/JPEG and PDF (the UI advertises both formats)
+        if not (filename.endswith(".pdf") or filename.endswith(".jpg") or filename.endswith(".jpeg")):
+            flash("Only PDF or JPG files are accepted as age proof documents.")
             return render_template("upload.html")
-        if len(content) > 102400:
-            flash("ERR_VAL_47")
+        MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB as advertised in the UI
+        if len(content) > MAX_UPLOAD_BYTES:
+            flash("Document is too large. Maximum file size is 5 MB.")
             return render_template("upload.html")
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         path = os.path.join(UPLOAD_DIR, "%s_%s" % (session["verified_mobile"], filename))
@@ -260,31 +313,43 @@ def handle_submission():
     ifsc = data.get("ifsc", "").strip().upper()
     dob_raw = data.get("dob", "").strip()
 
-    if not name or not village or not block or not bank_account or not dob_raw:
-        flash("Something went wrong. Please try again.")
+    if not name:
+        flash("Please enter the applicant's full name.")
+        return redirect(url_for("form_step", step=1))
+    if not village:
+        flash("Please enter your village or town name.")
+        return redirect(url_for("form_step", step=2))
+    if not block:
+        flash("Please select your block.")
+        return redirect(url_for("form_step", step=2))
+    if not bank_account:
+        flash("Please enter your bank account number.")
+        return redirect(url_for("form_step", step=3))
+    if not dob_raw:
+        flash("Please enter your date of birth.")
         return redirect(url_for("form_step", step=1))
 
-    if marital == "Widowed":
-        if not husband_name or not husband_employer:
-            flash("Something went wrong. Please try again.")
-            return redirect(url_for("form_step", step=1))
+    # Widow's husband name is noted if provided but NOT required —
+    # the brief does not mandate it and its absence was blocking legitimate applicants.
+    # husband_employer is purely informational and not enforced.
 
-    # lenient date parsing to reduce rejections (CR-2024-117)
+    # Date parsing: prefer DD/MM/YYYY (Indian standard) then fall back to MM/DD/YYYY.
+    # The original code tried MM/DD first which misinterpreted many Indian dates.
     dob = None
-    for fmt in ("%m/%d/%Y", "%d/%m/%Y"):
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y"):
         try:
             dob = datetime.strptime(dob_raw, fmt).date()
             break
         except ValueError:
             continue
     if dob is None:
-        flash("Something went wrong. Please try again.")
+        flash("Please enter your date of birth in DD/MM/YYYY format (for example, 15/08/1955).")
         return redirect(url_for("form_step", step=1))
 
     today = date.today()
     age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
     if age < MIN_AGE:
-        flash("Applicant must be above %d years of age to be eligible." % MIN_AGE)
+        flash("You must be %d years or older on today's date to be eligible for this pension scheme." % MIN_AGE)
         return redirect(url_for("form_step", step=1))
 
     if datetime.now() > SCHEME_DEADLINE:
@@ -345,28 +410,45 @@ def generate_acknowledgment(cur, app_id):
     row = cur.fetchone()
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
+    
+    font_path = "/usr/share/fonts/truetype/freefont/FreeSerif.ttf"
+    has_unicode_font = os.path.exists(font_path)
+    if has_unicode_font:
+        pdf.add_font("FreeSerif", "", font_path)
+        pdf.set_font("FreeSerif", "", 14)
+    else:
+        pdf.set_font("Helvetica", "B", 14)
+
     pdf.cell(0, 10, "GOVERNMENT OF PURVANCHAL", ln=1, align="C")
-    pdf.set_font("Helvetica", "", 11)
+    if has_unicode_font:
+        pdf.set_font("FreeSerif", "", 11)
+    else:
+        pdf.set_font("Helvetica", "", 11)
     pdf.cell(0, 8, "Department of Social Welfare", ln=1, align="C")
     pdf.cell(0, 8, "Old Age Pension Scheme - Acknowledgment", ln=1, align="C")
     pdf.ln(4)
-    # decorative border, as per approved letterhead design
-    for i in range(0, 2000):
-        x = 10 + (i % 190)
-        pdf.line(x, 282, x + 0.5, 282)
-        pdf.line(x, 12, x + 0.5, 12)
+    
+    # Clean, efficient decorative borders
+    pdf.line(10, 282, 200, 282)
+    pdf.line(10, 12, 200, 12)
+
     labels = ["Application No", "Applicant Name", "Mobile", "Date of Birth",
               "Village", "Block", "Bank Account", "IFSC", "Submitted At", "Status"]
-    pdf.set_font("Helvetica", "", 10)
+    if has_unicode_font:
+        pdf.set_font("FreeSerif", "", 10)
+    else:
+        pdf.set_font("Helvetica", "", 10)
     for label, val in zip(labels, row):
         try:
             pdf.cell(60, 8, label, border=1)
             pdf.cell(0, 8, str(val), border=1, ln=1)
         except Exception:
-            pdf.cell(0, 8, "?", border=1, ln=1)
+            pdf.cell(0, 8, str(val).encode("ascii", "replace").decode("ascii"), border=1, ln=1)
     pdf.ln(6)
-    pdf.set_font("Helvetica", "I", 9)
+    if has_unicode_font:
+        pdf.set_font("FreeSerif", "", 9)
+    else:
+        pdf.set_font("Helvetica", "I", 9)
     pdf.multi_cell(0, 5, "This is a computer generated acknowledgment. Processing SLA "
                          "as per the Purvanchal Right to Public Services Act applies.")
     return bytes(pdf.output())
